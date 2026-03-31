@@ -116,6 +116,21 @@ impl BTreeIndex {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Serialize the index to bytes for persistence.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        bincode::serialize(self).expect("BTreeIndex serialization should not fail")
+    }
+
+    /// Deserialize an index from bytes.
+    pub fn from_bytes(data: &[u8]) -> std::result::Result<Self, String> {
+        bincode::deserialize(data).map_err(|e| e.to_string())
+    }
+
+    /// File name for persisting this index.
+    pub fn file_name(&self) -> String {
+        format!("index_{}.bin", self.name)
+    }
 }
 
 #[cfg(test)]
