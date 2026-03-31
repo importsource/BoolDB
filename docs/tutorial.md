@@ -278,7 +278,65 @@ EXPLAIN SELECT title FROM books WHERE author_id = 1;
 EXPLAIN SELECT * FROM books INNER JOIN authors ON author_id = id;
 ```
 
-## 9. Dropping Tables
+## 9. Creating and Using Indexes
+
+Indexes speed up queries that filter on a specific column. BoolDB automatically creates indexes for PRIMARY KEY columns, but you can also create your own.
+
+### Automatic Primary Key Indexes
+
+When you created the `books` table with `id INTEGER PRIMARY KEY`, BoolDB automatically created an index named `pk_books_id`. You can verify this with EXPLAIN:
+
+```sql
+EXPLAIN SELECT * FROM books WHERE id = 1;
+```
+
+If the optimizer detects a matching index, EXPLAIN will show `IndexScan` instead of `SeqScan`.
+
+### Creating Manual Indexes
+
+Create an index on a frequently filtered column:
+
+```sql
+CREATE INDEX idx_books_author ON books (author_id);
+```
+
+Output:
+```
+Index 'idx_books_author' created on books.author_id (6 entries)
+```
+
+Now queries filtering on `author_id` can use this index:
+
+```sql
+EXPLAIN SELECT * FROM books WHERE author_id = 3;
+```
+
+### Index Persistence
+
+Indexes survive server restarts. Each index is stored in its own file:
+
+```
+booldb_data/
+├── index_pk_books_id.bin
+├── index_idx_books_author.bin
+└── ...
+```
+
+If an index file is lost or corrupt, BoolDB automatically rebuilds it by scanning the table on startup.
+
+### Dropping Indexes
+
+Remove an index you no longer need:
+
+```sql
+DROP INDEX idx_books_author;
+```
+
+This deletes the index from memory and removes its file. The underlying table data is not affected.
+
+**Note:** Indexes are automatically maintained when you INSERT, UPDATE, or DELETE rows — you don't need to do anything manually.
+
+## 10. Dropping Tables
 
 When you're done with a table:
 
@@ -288,7 +346,7 @@ DROP TABLE books;
 DROP TABLE authors;
 ```
 
-## 10. Data Persistence
+## 11. Data Persistence
 
 BoolDB persists data to disk. To verify:
 
@@ -308,7 +366,7 @@ cargo run --release -p booldb-cli
 booldb> SELECT * FROM books;  -- data persists!
 ```
 
-## 11. Using BoolDB as a Library
+## 12. Using BoolDB as a Library
 
 You can embed BoolDB directly in your Rust application without the TCP server:
 
@@ -349,7 +407,7 @@ Add to your `Cargo.toml`:
 booldb-core = { path = "path/to/booldb-core" }
 ```
 
-## 12. Writing a Custom TCP Client
+## 13. Writing a Custom TCP Client
 
 Any language can connect to BoolDB. Here's a Node.js example:
 

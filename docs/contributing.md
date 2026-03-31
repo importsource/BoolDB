@@ -135,7 +135,7 @@ Here are concrete tasks organized by difficulty:
 
 8. **Aggregate functions** — Support `SUM`, `AVG`, `MIN`, `MAX`, `COUNT` with `GROUP BY`.
 
-9. **CREATE INDEX / DROP INDEX** — SQL commands to create and drop indexes on existing tables, and automatically maintain them during INSERT/UPDATE/DELETE.
+9. **Disk-based B+Tree pages** — Replace the in-memory `BTreeMap` with a B+Tree stored on disk pages for indexes that exceed memory. Currently indexes are serialized whole to `index_{name}.bin` files; a page-based B+Tree would scale to much larger datasets.
 
 10. **Connection pooling** — Replace `Arc<Mutex<Database>>` with a connection pool that allows concurrent read transactions.
 

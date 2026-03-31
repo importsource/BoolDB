@@ -80,7 +80,7 @@ BoolDB is structured as a layered system. Each layer has a well-defined responsi
 | `storage/buffer.rs` | In-memory page cache with clock eviction |
 | `storage/heap.rs` | Unordered row storage across pages |
 | `catalog/schema.rs` | Table/index metadata and persistence |
-| `index/btree.rs` | In-memory B-Tree index |
+| `index/btree.rs` | B-Tree index with file-based persistence |
 | `sql/parser.rs` | SQL text to AST (wraps sqlparser-rs) |
 | `sql/planner.rs` | AST to `LogicalPlan` |
 | `sql/optimizer.rs` | Plan analysis, index selection, EXPLAIN |
@@ -342,7 +342,10 @@ The catalog is saved after every DDL/DML operation. This ensures that the table 
 3. Load Catalog from catalog.bin (if exists)
 4. For each table in catalog:
      Create HeapFile from stored page_ids
-5. Ready to accept queries
+5. For each index in catalog:
+     Load from index_{name}.bin
+     If file missing/corrupt → rebuild by scanning the heap
+6. Ready to accept queries
 ```
 
 ---
@@ -351,7 +354,35 @@ The catalog is saved after every DDL/DML operation. This ensures that the table 
 
 **File:** `booldb-core/src/index/btree.rs`
 
-BoolDB includes an in-memory B-Tree index built on Rust's `BTreeMap<Vec<u8>, Vec<RowId>>`.
+BoolDB includes a B-Tree index built on Rust's `BTreeMap<Vec<u8>, Vec<RowId>>`, with each index persisted to its own file.
+
+### Persistence
+
+Each index is serialized to an independent `index_{name}.bin` file using bincode:
+
+```rust
+// Save
+let bytes = index.to_bytes();  // bincode::serialize
+std::fs::write("index_pk_users_id.bin", bytes)?;
+
+// Load
+let bytes = std::fs::read("index_pk_users_id.bin")?;
+let index = BTreeIndex::from_bytes(&bytes)?;
+```
+
+**Index lifecycle:**
+
+| Event | Behavior |
+|-------|----------|
+| `CREATE TABLE` (with PRIMARY KEY) | Auto-creates `pk_{table}_{col}` index + file |
+| `CREATE INDEX name ON table (col)` | Builds index from heap scan, saves file |
+| `INSERT` / `UPDATE` / `DELETE` | Rebuilds affected indexes, updates files |
+| `DROP INDEX name` | Removes from memory, catalog, and deletes file |
+| `DROP TABLE` | Deletes all index files for that table |
+| Startup | Loads from file; if missing, rebuilds from heap scan |
+| Shutdown (`Drop`) | Flushes all indexes to files |
+
+**Resilience:** If an index file is missing or corrupt on startup, BoolDB logs a warning and rebuilds it by scanning the table's heap. This means indexes are never a single point of failure — they can always be reconstructed from the source data.
 
 ### Order-Preserving Key Encoding
 

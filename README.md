@@ -190,11 +190,48 @@ CREATE TABLE orders (
 
 ### DROP TABLE
 
-Remove a table and all its data.
+Remove a table and all its data (including all associated indexes).
 
 ```sql
 DROP TABLE table_name;
 ```
+
+### CREATE INDEX
+
+Create an index on a table column to speed up queries that filter on that column.
+
+```sql
+CREATE INDEX index_name ON table_name (column_name);
+```
+
+**Examples:**
+
+```sql
+CREATE INDEX idx_users_name ON users (name);
+CREATE INDEX idx_orders_user_id ON orders (user_id);
+```
+
+**Notes:**
+- PRIMARY KEY columns automatically get an index named `pk_{table}_{column}` on CREATE TABLE.
+- Each index is persisted to its own file (`index_{name}.bin`) in the data directory.
+- The index is built immediately by scanning all existing rows in the table.
+- Indexes are automatically maintained on INSERT, UPDATE, and DELETE.
+
+### DROP INDEX
+
+Remove an index.
+
+```sql
+DROP INDEX index_name;
+```
+
+**Example:**
+
+```sql
+DROP INDEX idx_users_name;
+```
+
+This removes the index from memory, the catalog, and deletes its persistent file. It does not affect the underlying table data.
 
 ### INSERT
 
@@ -399,12 +436,15 @@ When the server starts, it creates the following files in the data directory:
 
 ```
 booldb_data/
-├── data.db        Page-based data file (all table data)
-└── catalog.bin    Serialized catalog (table schemas, index metadata)
+├── data.db              Page-based data file (all table data)
+├── catalog.bin          Serialized catalog (table schemas, index metadata)
+├── index_pk_users_id.bin   Primary key index for 'users' table
+└── index_idx_name.bin      User-created index (CREATE INDEX)
 ```
 
 - `data.db` — Fixed-size pages (4 KB each) containing all row data. Grows as tables are populated.
 - `catalog.bin` — Binary-encoded catalog with all table schemas and index metadata. Updated on every DDL/DML operation.
+- `index_*.bin` — One file per index, serialized with bincode. Each index persists independently and is loaded on startup. If an index file is missing or corrupt, it is automatically rebuilt by scanning the table data.
 
 ## Client-Server Protocol
 
@@ -598,7 +638,30 @@ Each table is backed by a heap file — an unordered collection of pages. The he
 
 ## Index System
 
-BoolDB includes an in-memory B-Tree index implementation using Rust's `BTreeMap`.
+BoolDB includes a B-Tree index implementation using Rust's `BTreeMap`, with each index persisted to its own file on disk.
+
+### Persistence
+
+Each index is serialized to an independent file in the data directory:
+
+```
+booldb_data/
+├── index_pk_users_id.bin     ← auto-created for PRIMARY KEY
+├── index_idx_users_name.bin  ← user-created via CREATE INDEX
+└── ...
+```
+
+**Lifecycle:**
+
+| Event | Index behavior |
+|-------|---------------|
+| **CREATE TABLE** (with PK) | Auto-creates `pk_{table}_{column}` index and its file |
+| **CREATE INDEX** | Builds index by scanning the table, persists to file |
+| **INSERT / UPDATE / DELETE** | Rebuilds affected indexes, persists updated files |
+| **DROP INDEX** | Removes from memory, catalog, and deletes the file |
+| **DROP TABLE** | Removes all associated index files |
+| **Startup** | Loads each `index_{name}.bin`; if missing or corrupt, rebuilds from heap scan |
+| **Shutdown** | Flushes all indexes to their files |
 
 ### Key Encoding
 
@@ -838,16 +901,20 @@ BoolDB supports cross-type numeric comparison:
 
 ### Persistence Model
 
-BoolDB persists data in two ways:
+BoolDB persists data in three ways:
 
 1. **Data pages** (`data.db`): All row data stored in 4 KB pages. The buffer pool writes dirty pages to disk on flush/eviction/shutdown.
 
 2. **Catalog** (`catalog.bin`): Table schemas, heap page ID lists, and index metadata. Serialized with bincode after every DDL/DML operation.
 
+3. **Index files** (`index_{name}.bin`): Each index is serialized to its own file with bincode. Updated after every INSERT, UPDATE, DELETE, CREATE INDEX, or DROP INDEX. Flushed on shutdown.
+
 On startup, BoolDB:
 1. Opens the data file via the disk manager.
 2. Loads the catalog from `catalog.bin` (if it exists).
 3. Reconstructs heap file objects from the catalog's page ID lists.
+4. Loads each index from its `index_{name}.bin` file.
+5. If any index file is missing or corrupt, rebuilds the index by scanning the table's heap data.
 
 ### Error Types
 
@@ -881,7 +948,7 @@ cargo test --workspace
 
 ### Test Coverage
 
-BoolDB includes **63 unit tests** covering all modules:
+BoolDB includes **66 unit tests** covering all modules:
 
 | Module | Tests | What's Tested |
 |--------|-------|---------------|
@@ -897,7 +964,7 @@ BoolDB includes **63 unit tests** covering all modules:
 | `tx::wal` | 3 | Write/read WAL, recovery (committed vs aborted), truncate |
 | `tx::mvcc` | 5 | Begin/commit, abort, snapshot isolation, own-write visibility, concurrency |
 | `tx::lock` | 6 | Shared/exclusive locks, conflicts, upgrade, release |
-| `db` | 7 | Full SQL workflow, WHERE, UPDATE, DELETE, DROP, persistence, JOIN |
+| `db` | 10 | Full SQL workflow, WHERE, UPDATE, DELETE, DROP, persistence, JOIN, index persistence, index survives mutations, CREATE/DROP INDEX |
 
 ### Integration Testing
 
