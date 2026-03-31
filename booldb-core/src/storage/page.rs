@@ -5,7 +5,10 @@ pub const PAGE_SIZE: usize = 4096;
 
 /// Page header size in bytes.
 /// Layout: page_id(4) + page_type(1) + num_slots(2) + free_space_offset(2) + checksum(4) = 13 bytes
-const HEADER_SIZE: usize = 13;
+pub const HEADER_SIZE: usize = 13;
+
+/// Usable body size per page (PAGE_SIZE - HEADER_SIZE).
+pub const PAGE_BODY_SIZE: usize = PAGE_SIZE - HEADER_SIZE;
 
 /// Each slot entry: offset(2) + length(2) = 4 bytes
 const SLOT_ENTRY_SIZE: usize = 4;
