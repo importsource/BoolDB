@@ -1,0 +1,6 @@
+/target
+booldb_data/
+*.db
+*.bin
+*.log
+.DS_Store

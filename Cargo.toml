@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "booldb-core",
+    "booldb-server",
+    "booldb-cli",
+]
+resolver = "2"
