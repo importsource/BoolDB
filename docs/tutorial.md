@@ -313,16 +313,15 @@ EXPLAIN SELECT * FROM books WHERE author_id = 3;
 
 ### Index Persistence
 
-Indexes survive server restarts. Each index is stored in its own file:
+Indexes survive server restarts. B+Tree index pages are stored in `data.db` alongside table data — there are no separate index files. The catalog remembers each index's root page ID, which is all BoolDB needs to restore the full tree on startup.
 
 ```
 booldb_data/
-├── index_pk_books_id.bin
-├── index_idx_books_author.bin
-└── ...
+├── data.db       ← contains both table data AND B+Tree index pages
+└── catalog.bin   ← stores index root page IDs
 ```
 
-If an index file is lost or corrupt, BoolDB automatically rebuilds it by scanning the table on startup.
+If an index's root page ID is missing (e.g., after a migration), BoolDB automatically rebuilds it by scanning the table on startup.
 
 ### Dropping Indexes
 
@@ -332,7 +331,7 @@ Remove an index you no longer need:
 DROP INDEX idx_books_author;
 ```
 
-This deletes the index from memory and removes its file. The underlying table data is not affected.
+This removes the index from memory and the catalog. The underlying table data is not affected.
 
 **Note:** Indexes are automatically maintained when you INSERT, UPDATE, or DELETE rows — you don't need to do anything manually.
 

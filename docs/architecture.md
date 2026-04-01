@@ -80,7 +80,8 @@ BoolDB is structured as a layered system. Each layer has a well-defined responsi
 | `storage/buffer.rs` | In-memory page cache with clock eviction |
 | `storage/heap.rs` | Unordered row storage across pages |
 | `catalog/schema.rs` | Table/index metadata and persistence |
-| `index/btree.rs` | B-Tree index with file-based persistence |
+| `index/btree.rs` | In-memory B-Tree (used for testing/reference) |
+| `index/disk_btree.rs` | Disk-based B+Tree stored on pages in data.db |
 | `sql/parser.rs` | SQL text to AST (wraps sqlparser-rs) |
 | `sql/planner.rs` | AST to `LogicalPlan` |
 | `sql/optimizer.rs` | Plan analysis, index selection, EXPLAIN |
@@ -343,50 +344,135 @@ The catalog is saved after every DDL/DML operation. This ensures that the table 
 4. For each table in catalog:
      Create HeapFile from stored page_ids
 5. For each index in catalog:
-     Load from index_{name}.bin
-     If file missing/corrupt → rebuild by scanning the heap
-6. Ready to accept queries
+     Restore DiskBTree from root_page_id (pages already in data.db)
+     If root_page_id is 0/missing → rebuild by scanning the heap
+6. Clean up any legacy index_*.bin files from older format
+7. Ready to accept queries
 ```
 
 ---
 
 ## Index Engine
 
-**File:** `booldb-core/src/index/btree.rs`
+**File:** `booldb-core/src/index/disk_btree.rs`
 
-BoolDB includes a B-Tree index built on Rust's `BTreeMap<Vec<u8>, Vec<RowId>>`, with each index persisted to its own file.
+BoolDB uses a disk-based B+Tree stored on pages inside `data.db` — the same file and buffer pool used by table data.
 
-### Persistence
+### Unified Storage
 
-Each index is serialized to an independent `index_{name}.bin` file using bincode:
+B+Tree pages and heap pages coexist in the same `data.db` file, distinguished by the `page_type` header byte:
 
-```rust
-// Save
-let bytes = index.to_bytes();  // bincode::serialize
-std::fs::write("index_pk_users_id.bin", bytes)?;
-
-// Load
-let bytes = std::fs::read("index_pk_users_id.bin")?;
-let index = BTreeIndex::from_bytes(&bytes)?;
+```
+data.db
+┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Page 0  │ Page 1  │ Page 2  │ Page 3  │ Page 4  │ Page 5  │
+│  Heap   │  Heap   │  BTree  │  BTree  │  BTree  │  Heap   │
+│ (users) │ (users) │  Leaf   │  Leaf   │Internal │(orders) │
+│ type=1  │ type=1  │ type=3  │ type=3  │ type=2  │ type=1  │
+└─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
-**Index lifecycle:**
+**Why one file?**
+1. **Single buffer pool** caches both data and index pages — no separate cache management.
+2. **Atomic persistence** — flushing the buffer pool saves everything together.
+3. **Simpler operations** — one file to manage, back up, and restore.
+4. **No redundant I/O** — index pages are cached just like data pages.
+
+This is the same approach used by PostgreSQL, MySQL InnoDB, and SQLite.
+
+### Node Structure
+
+Each B+Tree node occupies a single 4 KB page. The node data is serialized with bincode into the page body (after the 13-byte page header):
+
+```
+Page layout for a B+Tree node:
+┌─────────────┬───────────┬──────────────────────────────┐
+│ Page Header │ Data Len  │ Bincode-serialized BTreeNode │
+│ (13 bytes)  │ (4 bytes) │ (variable)                   │
+└─────────────┴───────────┴──────────────────────────────┘
+```
+
+```rust
+struct BTreeNode {
+    is_leaf: bool,
+    keys: Vec<Vec<u8>>,        // sorted encoded keys
+    children: Vec<PageId>,      // internal only: child page pointers
+    values: Vec<Vec<RowId>>,    // leaf only: RowIds per key
+    next_leaf: Option<PageId>,  // leaf only: linked list for range scan
+}
+```
+
+**Leaf nodes** store the actual data (keys → RowIds) and form a linked list via `next_leaf` for efficient range scans and full scans.
+
+**Internal nodes** store separator keys and child page pointers, guiding search down the tree.
+
+### Tree Structure
+
+```
+                 [Internal Node - Page 4]
+                keys: [50, 100]
+               /        |         \
+     [Leaf Page 2]  [Leaf Page 3]  [Leaf Page 5]
+     keys: 1..49    keys: 50..99   keys: 100..150
+     next→Page 3    next→Page 5    next→None
+```
+
+**Tree properties:**
+
+| Property | Value |
+|----------|-------|
+| Page size | 4 KB |
+| Split threshold | ~3600 bytes per node |
+| Entries per leaf | ~150–250 (depends on key size) |
+| Internal fanout | ~200–400 |
+| Depth for 500 rows | 2 |
+| Depth for 5,000 rows | 2–3 |
+| Depth for 1M rows | ~3 |
+
+### Split Algorithm
+
+When a node exceeds the split threshold (~3600 bytes serialized):
+
+**Leaf split:**
+1. Find midpoint `mid = keys.len() / 2`.
+2. Create a new right leaf with `keys[mid..]` and `values[mid..]`.
+3. Left leaf keeps `keys[..mid]` and `values[..mid]`.
+4. Update `next_leaf` pointers (left → right → old next).
+5. Push `keys[mid]` (first key of right leaf) up to the parent.
+
+**Internal split:**
+1. Find midpoint `mid = keys.len() / 2`.
+2. Push `keys[mid]` up to the parent.
+3. Right node gets `keys[mid+1..]` and `children[mid+1..]`.
+4. Left node keeps `keys[..mid]` and `children[..mid+1]`.
+
+**Root split:** If the root itself splits, a new root is created with one key and two children. This is the only operation that increases tree depth.
+
+### Persistence and Recovery
+
+The catalog stores each index's **root page ID** — a single `u32`. On startup:
+
+1. BoolDB reads the root page ID from `IndexMeta` in the catalog.
+2. It creates a `DiskBTree` pointing to that root.
+3. The entire tree is immediately accessible through the buffer pool — no loading or deserialization needed.
+
+If the root page ID is 0 or missing (e.g., after migration from an older format), BoolDB rebuilds the index by scanning the heap and inserting each row into a fresh B+Tree.
+
+### Lifecycle
 
 | Event | Behavior |
 |-------|----------|
-| `CREATE TABLE` (with PRIMARY KEY) | Auto-creates `pk_{table}_{col}` index + file |
-| `CREATE INDEX name ON table (col)` | Builds index from heap scan, saves file |
-| `INSERT` / `UPDATE` / `DELETE` | Rebuilds affected indexes, updates files |
-| `DROP INDEX name` | Removes from memory, catalog, and deletes file |
-| `DROP TABLE` | Deletes all index files for that table |
-| Startup | Loads from file; if missing, rebuilds from heap scan |
-| Shutdown (`Drop`) | Flushes all indexes to files |
-
-**Resilience:** If an index file is missing or corrupt on startup, BoolDB logs a warning and rebuilds it by scanning the table's heap. This means indexes are never a single point of failure — they can always be reconstructed from the source data.
+| `CREATE TABLE` (with PK) | Creates empty `DiskBTree`, registers in catalog |
+| `CREATE INDEX` | Builds B+Tree from heap scan, stores root page ID in catalog |
+| `INSERT` / `UPDATE` / `DELETE` | Rebuilds affected B+Tree indexes |
+| `DROP INDEX` | Removes from memory and catalog |
+| `DROP TABLE` | Removes all associated indexes |
+| Startup | Restores `DiskBTree` from root page ID (pages already in `data.db`) |
+| Shutdown | Flushes buffer pool (persists all dirty B+Tree pages) |
 
 ### Order-Preserving Key Encoding
 
-The key challenge is encoding different types into bytes while preserving their natural sort order. BoolDB uses a type-tagged encoding:
+Values are encoded into bytes that preserve their natural sort order:
 
 ```
 NULL:       [0x00]
@@ -396,39 +482,25 @@ Float:      [0x03, 8 bytes: IEEE 754-flipped big-endian u64]
 Text:       [0x04, UTF-8 bytes]
 ```
 
-**Integer encoding trick:** To make signed integers sort correctly in byte order, we XOR with `1 << 63` to flip the sign bit, then store in big-endian:
+**Integer encoding trick:** XOR with `1 << 63` to flip the sign bit, then big-endian:
 
 ```rust
 let ordered = (*v as u64) ^ (1u64 << 63);
 buf.extend_from_slice(&ordered.to_be_bytes());
 ```
 
-This maps:
-- `i64::MIN` (-9223372036854775808) → `0x0000000000000000`
-- `-1` → `0x7FFFFFFFFFFFFFFF`
-- `0` → `0x8000000000000000`
-- `i64::MAX` → `0xFFFFFFFFFFFFFFFF`
+This maps `i64::MIN` → `0x00..00`, `-1` → `0x7F..FF`, `0` → `0x80..00`, `i64::MAX` → `0xFF..FF`.
 
-**Float encoding trick:** IEEE 754 doubles are transformed so that byte comparison matches numerical order:
+**Float encoding trick:** IEEE 754 sign-flip ensures byte comparison matches numerical order:
 
 ```rust
 let bits = v.to_bits();
-let ordered = if bits & (1u64 << 63) != 0 {
-    !bits           // negative: flip all bits
-} else {
-    bits ^ (1u64 << 63)  // positive: flip sign bit
-};
+let ordered = if bits & (1u64 << 63) != 0 { !bits } else { bits ^ (1u64 << 63) };
 ```
 
 ### Duplicate Key Support
 
-Multiple RowIds can map to the same key. The index stores `Vec<RowId>` per key:
-
-```rust
-entries: BTreeMap<Vec<u8>, Vec<RowId>>
-```
-
-This is important for non-unique indexes (e.g., indexing a `name` column where multiple users share the same name).
+Each leaf entry stores a `Vec<RowId>`, allowing multiple rows to share the same key value. This supports non-unique indexes (e.g., indexing a `name` column).
 
 ---
 

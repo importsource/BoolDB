@@ -213,7 +213,7 @@ CREATE INDEX idx_orders_user_id ON orders (user_id);
 
 **Notes:**
 - PRIMARY KEY columns automatically get an index named `pk_{table}_{column}` on CREATE TABLE.
-- Each index is persisted to its own file (`index_{name}.bin`) in the data directory.
+- Index data is stored on B+Tree pages inside `data.db` alongside table data — no separate files.
 - The index is built immediately by scanning all existing rows in the table.
 - Indexes are automatically maintained on INSERT, UPDATE, and DELETE.
 
@@ -231,7 +231,7 @@ DROP INDEX index_name;
 DROP INDEX idx_users_name;
 ```
 
-This removes the index from memory, the catalog, and deletes its persistent file. It does not affect the underlying table data.
+This removes the index from memory and the catalog. The underlying table data is not affected. The B+Tree pages in `data.db` become reclaimable.
 
 ### INSERT
 
@@ -436,15 +436,14 @@ When the server starts, it creates the following files in the data directory:
 
 ```
 booldb_data/
-├── data.db              Page-based data file (all table data)
-├── catalog.bin          Serialized catalog (table schemas, index metadata)
-├── index_pk_users_id.bin   Primary key index for 'users' table
-└── index_idx_name.bin      User-created index (CREATE INDEX)
+├── data.db        Page-based data file (table data + B+Tree index pages)
+└── catalog.bin    Serialized catalog (table schemas, index root page IDs)
 ```
 
-- `data.db` — Fixed-size pages (4 KB each) containing all row data. Grows as tables are populated.
-- `catalog.bin` — Binary-encoded catalog with all table schemas and index metadata. Updated on every DDL/DML operation.
-- `index_*.bin` — One file per index, serialized with bincode. Each index persists independently and is loaded on startup. If an index file is missing or corrupt, it is automatically rebuilt by scanning the table data.
+- `data.db` — Fixed-size 4 KB pages containing **both** table heap data and B+Tree index nodes. Heap pages and B+Tree pages are interleaved in the same file, distinguished by their page type header byte. Grows as tables and indexes are populated.
+- `catalog.bin` — Binary-encoded catalog with all table schemas and index metadata (including B+Tree root page IDs). Updated on every DDL/DML operation.
+
+This unified file design means a single buffer pool caches both data and index pages, and a single flush persists everything atomically.
 
 ## Client-Server Protocol
 
@@ -638,30 +637,48 @@ Each table is backed by a heap file — an unordered collection of pages. The he
 
 ## Index System
 
-BoolDB includes a B-Tree index implementation using Rust's `BTreeMap`, with each index persisted to its own file on disk.
+BoolDB includes a disk-based B+Tree index stored on pages inside `data.db` — the same file that holds table data.
 
-### Persistence
+### How It Works
 
-Each index is serialized to an independent file in the data directory:
+B+Tree nodes (both internal and leaf) are stored as individual 4 KB pages, sharing the same file and buffer pool as heap data:
 
 ```
-booldb_data/
-├── index_pk_users_id.bin     ← auto-created for PRIMARY KEY
-├── index_idx_users_name.bin  ← user-created via CREATE INDEX
-└── ...
+data.db
+┌─────────┬─────────┬─────────┬─────────┬─────────┬─────────┐
+│ Page 0  │ Page 1  │ Page 2  │ Page 3  │ Page 4  │ Page 5  │
+│  Heap   │  Heap   │  BTree  │  BTree  │  BTree  │  Heap   │
+│ (users) │ (users) │  Leaf   │  Leaf   │Internal │(orders) │
+└─────────┴─────────┴─────────┴─────────┴─────────┴─────────┘
 ```
 
-**Lifecycle:**
+- **Leaf nodes** store sorted keys, RowId lists, and a `next_leaf` pointer for efficient range scans.
+- **Internal nodes** store sorted keys and child page pointers.
+- The catalog stores each index's **root page ID** — that single pointer is all that's needed to traverse the entire tree on startup.
+
+### Tree Properties
+
+| Property | Value |
+|----------|-------|
+| Page size | 4 KB |
+| Split threshold | ~3600 bytes per node |
+| Entries per leaf | ~150–250 (depends on key size) |
+| Internal fanout | ~200–400 |
+| Depth for 500 rows | 2 |
+| Depth for 5,000 rows | 2–3 |
+| Depth for 1M rows | ~3 |
+
+### Lifecycle
 
 | Event | Index behavior |
 |-------|---------------|
-| **CREATE TABLE** (with PK) | Auto-creates `pk_{table}_{column}` index and its file |
-| **CREATE INDEX** | Builds index by scanning the table, persists to file |
-| **INSERT / UPDATE / DELETE** | Rebuilds affected indexes, persists updated files |
-| **DROP INDEX** | Removes from memory, catalog, and deletes the file |
-| **DROP TABLE** | Removes all associated index files |
-| **Startup** | Loads each `index_{name}.bin`; if missing or corrupt, rebuilds from heap scan |
-| **Shutdown** | Flushes all indexes to their files |
+| **CREATE TABLE** (with PK) | Auto-creates `pk_{table}_{column}` B+Tree (empty) |
+| **CREATE INDEX** | Builds B+Tree by scanning the table |
+| **INSERT / UPDATE / DELETE** | Rebuilds affected B+Tree indexes |
+| **DROP INDEX** | Removes from memory and catalog; B+Tree pages become reclaimable |
+| **DROP TABLE** | Removes all associated indexes |
+| **Startup** | Restores B+Tree from root page ID in catalog (pages already in `data.db`) |
+| **Shutdown** | Flushes buffer pool (persists all dirty pages including B+Tree nodes) |
 
 ### Key Encoding
 
@@ -901,20 +918,18 @@ BoolDB supports cross-type numeric comparison:
 
 ### Persistence Model
 
-BoolDB persists data in three ways:
+BoolDB persists data in two files:
 
-1. **Data pages** (`data.db`): All row data stored in 4 KB pages. The buffer pool writes dirty pages to disk on flush/eviction/shutdown.
+1. **Data pages** (`data.db`): All row data **and** B+Tree index nodes stored as 4 KB pages. Heap pages and B+Tree pages coexist in the same file, sharing the same buffer pool. Dirty pages are written to disk on flush, eviction, or shutdown.
 
-2. **Catalog** (`catalog.bin`): Table schemas, heap page ID lists, and index metadata. Serialized with bincode after every DDL/DML operation.
-
-3. **Index files** (`index_{name}.bin`): Each index is serialized to its own file with bincode. Updated after every INSERT, UPDATE, DELETE, CREATE INDEX, or DROP INDEX. Flushed on shutdown.
+2. **Catalog** (`catalog.bin`): Table schemas, heap page ID lists, and index metadata (including B+Tree root page IDs). Serialized with bincode after every DDL/DML operation.
 
 On startup, BoolDB:
 1. Opens the data file via the disk manager.
 2. Loads the catalog from `catalog.bin` (if it exists).
 3. Reconstructs heap file objects from the catalog's page ID lists.
-4. Loads each index from its `index_{name}.bin` file.
-5. If any index file is missing or corrupt, rebuilds the index by scanning the table's heap data.
+4. Reconstructs B+Tree indexes from the root page IDs stored in the catalog — the actual tree nodes are already in `data.db`.
+5. If a root page ID is missing (e.g., migrated from an older format), rebuilds the index by scanning the table's heap data.
 
 ### Error Types
 
