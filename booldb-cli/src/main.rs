@@ -60,15 +60,17 @@ fn main() {
                         break;
                     }
                     "\\dt" => {
-                        // List tables — send a special meta-query
-                        send_and_display(
-                            &mut stream,
-                            "SELECT table_name FROM booldb_tables",
-                        );
+                        send_and_display(&mut stream, "SHOW TABLES");
+                    }
+                    "\\di" => {
+                        send_and_display(&mut stream, "SHOW INDEXES");
                     }
                     cmd if cmd.starts_with("\\d ") => {
                         let table = cmd.trim_start_matches("\\d ").trim();
-                        println!("(describe table '{}' — not yet implemented)", table);
+                        send_and_display(
+                            &mut stream,
+                            &format!("DESCRIBE {}", table),
+                        );
                     }
                     "\\help" | "\\?" => {
                         print_help();
@@ -195,10 +197,11 @@ fn print_table(columns: &[String], rows: &[Vec<String>]) {
 
 fn print_help() {
     println!("BoolDB CLI Commands:");
-    println!("  \\q          Quit");
-    println!("  \\dt         List tables");
-    println!("  \\d TABLE    Describe table");
-    println!("  \\help       Show this help");
+    println!("  \\q            Quit");
+    println!("  \\dt           List tables");
+    println!("  \\di           List indexes");
+    println!("  \\d TABLE      Describe table columns");
+    println!("  \\help         Show this help");
     println!();
     println!("SQL Commands:");
     println!("  CREATE TABLE name (col TYPE, ...)");
@@ -207,6 +210,12 @@ fn print_help() {
     println!("  SELECT ... FROM name [WHERE ...] [JOIN ...]");
     println!("  UPDATE name SET col = val [WHERE ...]");
     println!("  DELETE FROM name [WHERE ...]");
+    println!("  CREATE INDEX name ON table (column)");
+    println!("  DROP INDEX name");
+    println!("  SHOW TABLES");
+    println!("  SHOW INDEXES [ON table]");
+    println!("  DESCRIBE table");
+    println!("  EXPLAIN SELECT ...");
     println!();
     println!("Types: INTEGER, FLOAT, TEXT, BOOLEAN");
     println!();

@@ -181,13 +181,34 @@ impl Database {
             });
         }
 
+        // Handle SHOW TABLES
+        let upper = trimmed.to_uppercase();
+        if upper == "SHOW TABLES" || upper == "SHOW TABLES;" {
+            return self.execute_show_tables();
+        }
+
+        // Handle SHOW INDEXES / SHOW INDEXES ON table
+        if upper.starts_with("SHOW INDEX") {
+            return self.execute_show_indexes(trimmed);
+        }
+
+        // Handle DESCRIBE table / DESC table
+        if upper.starts_with("DESCRIBE ") || upper.starts_with("DESC ") {
+            let table_name = if upper.starts_with("DESCRIBE ") {
+                trimmed[9..].trim().trim_end_matches(';').trim()
+            } else {
+                trimmed[5..].trim().trim_end_matches(';').trim()
+            };
+            return self.execute_describe(table_name);
+        }
+
         // Handle CREATE INDEX
-        if trimmed.to_uppercase().starts_with("CREATE INDEX ") {
+        if upper.starts_with("CREATE INDEX ") {
             return self.execute_create_index(trimmed);
         }
 
         // Handle DROP INDEX
-        if trimmed.to_uppercase().starts_with("DROP INDEX ") {
+        if upper.starts_with("DROP INDEX ") {
             return self.execute_drop_index(trimmed);
         }
 
@@ -345,6 +366,117 @@ impl Database {
 
         Ok(ExecResult::Ok {
             message: format!("Index '{}' dropped", idx_name),
+        })
+    }
+
+    /// SHOW TABLES
+    fn execute_show_tables(&self) -> Result<ExecResult> {
+        let mut names = self.catalog.table_names();
+        names.sort();
+        let rows: Vec<crate::types::Row> = names
+            .into_iter()
+            .map(|n| vec![Value::Text(n)])
+            .collect();
+        Ok(ExecResult::Rows {
+            columns: vec!["table_name".to_string()],
+            rows,
+        })
+    }
+
+    /// SHOW INDEXES [ON table]
+    fn execute_show_indexes(&mut self, sql: &str) -> Result<ExecResult> {
+        let upper = sql.to_uppercase();
+        let table_filter = if upper.contains(" ON ") {
+            let pos = sql.to_uppercase().find(" ON ").unwrap();
+            Some(sql[pos + 4..].trim().trim_end_matches(';').trim().to_string())
+        } else {
+            None
+        };
+
+        let mut rows: Vec<crate::types::Row> = Vec::new();
+
+        for table_name in self.catalog.table_names() {
+            if let Some(ref filter) = table_filter {
+                if table_name != *filter {
+                    continue;
+                }
+            }
+            let meta = self.catalog.get_table(&table_name)?;
+            for (idx_name, idx_meta) in &meta.indexes {
+                let col_name = meta
+                    .schema
+                    .columns
+                    .get(idx_meta.column_index)
+                    .map(|c| c.name.as_str())
+                    .unwrap_or("?");
+                let entry_count = self
+                    .indexes
+                    .get(idx_name)
+                    .map(|idx| idx.len(&mut self.pool).unwrap_or(0))
+                    .unwrap_or(0);
+                let depth = self
+                    .indexes
+                    .get(idx_name)
+                    .map(|idx| idx.depth(&mut self.pool).unwrap_or(0))
+                    .unwrap_or(0);
+
+                rows.push(vec![
+                    Value::Text(table_name.clone()),
+                    Value::Text(idx_name.clone()),
+                    Value::Text(col_name.to_string()),
+                    Value::Integer(entry_count as i64),
+                    Value::Integer(depth as i64),
+                ]);
+            }
+        }
+
+        rows.sort_by(|a, b| {
+            let ta = if let Value::Text(s) = &a[0] { s.as_str() } else { "" };
+            let tb = if let Value::Text(s) = &b[0] { s.as_str() } else { "" };
+            ta.cmp(tb).then_with(|| {
+                let ia = if let Value::Text(s) = &a[1] { s.as_str() } else { "" };
+                let ib = if let Value::Text(s) = &b[1] { s.as_str() } else { "" };
+                ia.cmp(ib)
+            })
+        });
+
+        Ok(ExecResult::Rows {
+            columns: vec![
+                "table".to_string(),
+                "index_name".to_string(),
+                "column".to_string(),
+                "entries".to_string(),
+                "depth".to_string(),
+            ],
+            rows,
+        })
+    }
+
+    /// DESCRIBE table / DESC table
+    fn execute_describe(&self, table_name: &str) -> Result<ExecResult> {
+        let meta = self.catalog.get_table(table_name)?;
+        let rows: Vec<crate::types::Row> = meta
+            .schema
+            .columns
+            .iter()
+            .map(|col| {
+                vec![
+                    Value::Text(col.name.clone()),
+                    Value::Text(col.data_type.to_string()),
+                    Value::Boolean(col.nullable),
+                    Value::Boolean(col.primary_key),
+                ]
+            })
+            .collect();
+
+        Ok(ExecResult::Rows {
+            columns: vec![
+                "column".to_string(),
+                "type".to_string(),
+                "nullable".to_string(),
+                "primary_key".to_string(),
+            ],
+            rows,
         })
     }
 
