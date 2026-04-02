@@ -65,6 +65,7 @@ booldb> EXPLAIN SELECT * FROM users WHERE age > 27;
 - [Index System](#index-system)
 - [Transaction System](#transaction-system)
 - [Using BoolDB as a Library](#using-booldb-as-a-library)
+- [JSON Support](#json-support)
 - [Internals Deep Dive](#internals-deep-dive)
 - [Testing](#testing)
 
@@ -775,6 +776,31 @@ The lock manager provides shared and exclusive row-level locks:
 - Multiple transactions can hold shared locks on the same row.
 - A transaction can upgrade its own shared lock to exclusive.
 - All locks are released when a transaction commits or aborts.
+
+## JSON Support
+
+BoolDB supports storing, querying, and indexing JSON data.
+
+```sql
+-- JSON column type
+CREATE TABLE events (id INTEGER PRIMARY KEY, data JSON);
+INSERT INTO events VALUES (1, '{"name": "Alice", "age": 30, "city": "NYC"}');
+
+-- Extract values with json_extract()
+SELECT json_extract(data, '$.name'), json_extract(data, '$.age') FROM events;
+
+-- Filter on JSON paths (supports AND/OR with multiple criteria)
+SELECT * FROM events
+WHERE json_extract(data, '$.age') > 25
+  AND json_extract(data, '$.city') = 'NYC';
+
+-- Expression index for fast JSON path lookups
+CREATE INDEX idx_name ON events (json_extract(data, '$.name'));
+```
+
+**Supported paths:** `$.field`, `$.nested.field`, `$.array[0]`, `$.array[0].field`
+
+For the full reference including expression indexes, type mapping, multiple filter criteria, and worked examples, see the [JSON Guide](docs/json.md).
 
 ## Using BoolDB as a Library
 
