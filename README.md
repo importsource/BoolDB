@@ -66,6 +66,7 @@ booldb> EXPLAIN SELECT * FROM users WHERE age > 27;
 - [Transaction System](#transaction-system)
 - [Using BoolDB as a Library](#using-booldb-as-a-library)
 - [JSON Support](#json-support)
+- [Metadata & Management](#metadata--management)
 - [Internals Deep Dive](#internals-deep-dive)
 - [Testing](#testing)
 
@@ -801,6 +802,22 @@ CREATE INDEX idx_name ON events (json_extract(data, '$.name'));
 **Supported paths:** `$.field`, `$.nested.field`, `$.array[0]`, `$.array[0].field`
 
 For the full reference including expression indexes, type mapping, multiple filter criteria, and worked examples, see the [JSON Guide](docs/json.md).
+
+## Metadata & Management
+
+BoolDB provides commands for inspecting database structure and managing indexes:
+
+```sql
+SHOW TABLES;                    -- List all tables
+DESCRIBE users;                 -- Show columns, types, constraints
+SHOW INDEXES;                   -- List all indexes (with entry count and B+Tree depth)
+SHOW INDEXES ON users;          -- Indexes for a specific table
+EXPLAIN SELECT * FROM users;    -- Query execution plan
+```
+
+CLI shortcuts: `\dt` (tables), `\di` (indexes), `\d table` (describe).
+
+For the full reference including data directory management, backup/restore, and practical workflows, see the [Metadata & Management Guide](docs/metadata.md).
 
 ## Using BoolDB as a Library
 
