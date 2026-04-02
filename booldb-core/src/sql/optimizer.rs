@@ -1,5 +1,5 @@
 use crate::catalog::schema::Catalog;
-use crate::sql::planner::{CmpOp, FilterExpr, LogicalPlan, Projection};
+use crate::sql::planner::{CmpOp, FilterExpr, LogicalPlan, Projection, SelectExpr};
 
 /// Optimization hints produced by the optimizer.
 #[derive(Debug, Clone)]
@@ -46,8 +46,17 @@ pub fn optimize(plan: &LogicalPlan, catalog: &Catalog) -> QueryHints {
             }
 
             // Compute needed columns for early projection.
-            if let Projection::Columns(cols) = projection {
-                hints.needed_columns = Some(cols.clone());
+            if let Projection::Expressions(exprs) = projection {
+                let cols: Vec<String> = exprs
+                    .iter()
+                    .filter_map(|e| match e {
+                        SelectExpr::Column(c) => Some(c.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if !cols.is_empty() {
+                    hints.needed_columns = Some(cols);
+                }
             }
 
             hints
@@ -119,8 +128,17 @@ pub fn explain(plan: &LogicalPlan, catalog: &Catalog) -> String {
 
             match projection {
                 Projection::All => lines.push("  Projection: *".to_string()),
-                Projection::Columns(cols) => {
-                    lines.push(format!("  Projection: {}", cols.join(", ")));
+                Projection::Expressions(exprs) => {
+                    let names: Vec<String> = exprs
+                        .iter()
+                        .map(|e| match e {
+                            SelectExpr::Column(c) => c.clone(),
+                            SelectExpr::JsonExtract { column, path } => {
+                                format!("json_extract({}, '{}')", column, path)
+                            }
+                        })
+                        .collect();
+                    lines.push(format!("  Projection: {}", names.join(", ")));
                 }
             }
         }
@@ -179,6 +197,22 @@ fn format_filter(filter: &FilterExpr) -> String {
         FilterExpr::Not(inner) => format!("NOT ({})", format_filter(inner)),
         FilterExpr::IsNull(col) => format!("{} IS NULL", col),
         FilterExpr::IsNotNull(col) => format!("{} IS NOT NULL", col),
+        FilterExpr::JsonExtract {
+            column,
+            path,
+            op,
+            value,
+        } => {
+            let op_str = match op {
+                CmpOp::Eq => "=",
+                CmpOp::NotEq => "!=",
+                CmpOp::Lt => "<",
+                CmpOp::LtEq => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::GtEq => ">=",
+            };
+            format!("json_extract({}, '{}') {} {}", column, path, op_str, value)
+        }
     }
 }
 
@@ -215,6 +249,7 @@ mod tests {
                 table_name: "users".to_string(),
                 column_index: 0,
                 root_page_id: 0,
+                json_path: None,
             },
         )
         .unwrap();
@@ -263,7 +298,10 @@ mod tests {
         let cat = setup_catalog();
         let plan = LogicalPlan::Select {
             table_name: "users".to_string(),
-            projection: Projection::Columns(vec!["id".to_string(), "name".to_string()]),
+            projection: Projection::Expressions(vec![
+                SelectExpr::Column("id".to_string()),
+                SelectExpr::Column("name".to_string()),
+            ]),
             filter: Some(FilterExpr::Comparison {
                 column: "id".to_string(),
                 op: CmpOp::Eq,

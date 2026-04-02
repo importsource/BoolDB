@@ -24,6 +24,9 @@ pub struct IndexMeta {
     pub column_index: usize,
     /// Root page ID of the B+Tree.
     pub root_page_id: PageId,
+    /// For expression indexes: the JSON path to extract (e.g., "$.name").
+    #[serde(default)]
+    pub json_path: Option<String>,
 }
 
 /// In-memory catalog of all tables and indexes.
@@ -193,6 +196,7 @@ mod tests {
                 table_name: "users".to_string(),
                 column_index: 0,
                 root_page_id: 42,
+                json_path: None,
             },
         )
         .unwrap();

@@ -32,6 +32,8 @@ pub fn convert_data_type(sql_type: &SqlDataType) -> Result<DataType> {
 
         SqlDataType::Boolean => Ok(DataType::Boolean),
 
+        SqlDataType::JSON => Ok(DataType::Json),
+
         other => Err(BoolDBError::Parse(format!(
             "Unsupported data type: {:?}",
             other

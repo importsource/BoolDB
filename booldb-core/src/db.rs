@@ -9,6 +9,7 @@ use crate::sql::planner;
 use crate::storage::buffer::BufferPool;
 use crate::storage::disk::DiskManager;
 use crate::storage::heap::HeapFile;
+use crate::sql::json;
 use crate::types::Value;
 
 const DEFAULT_BUFFER_POOL_SIZE: usize = 256;
@@ -102,7 +103,7 @@ impl Database {
         let table_names = self.catalog.table_names();
         for table_name in &table_names {
             let meta = self.catalog.get_table(table_name)?;
-            let to_rebuild: Vec<(String, usize)> = meta
+            let to_rebuild: Vec<(String, usize, Option<String>)> = meta
                 .indexes
                 .iter()
                 .filter(|(name, _)| {
@@ -111,10 +112,10 @@ impl Database {
                         .map(|idx| idx.root_page_id().is_none())
                         .unwrap_or(true)
                 })
-                .map(|(name, m)| (name.clone(), m.column_index))
+                .map(|(name, m)| (name.clone(), m.column_index, m.json_path.clone()))
                 .collect();
 
-            for (idx_name, col_idx) in to_rebuild {
+            for (idx_name, col_idx, json_path) in to_rebuild {
                 let heap = self
                     .heaps
                     .get(table_name)
@@ -127,9 +128,8 @@ impl Database {
 
                 let idx = self.indexes.get_mut(&idx_name).unwrap();
                 for tuple in &tuples {
-                    if col_idx < tuple.values.len() {
-                        idx.insert(&mut self.pool, &tuple.values[col_idx], tuple.row_id)?;
-                    }
+                    let key = Self::extract_index_key(&tuple.values, col_idx, &json_path);
+                    idx.insert(&mut self.pool, &key, tuple.row_id)?;
                 }
 
                 // Update root_page_id in catalog.
@@ -231,6 +231,7 @@ impl Database {
                                 table_name: schema.table_name.clone(),
                                 column_index: i,
                                 root_page_id: 0,
+                                json_path: None,
                             },
                         )?;
                         self.indexes.insert(idx_name, idx);
@@ -279,24 +280,21 @@ impl Database {
             ));
         }
         let table_name = parts[4].to_string();
-        let rest = sql[sql.find('(').ok_or_else(|| {
-            BoolDBError::Parse("Expected (column) after table name".to_string())
-        })? + 1..]
-            .trim();
-        let col_name = rest
-            .trim_end_matches(')')
-            .trim_end_matches(';')
-            .trim()
-            .to_string();
 
-        if col_name.is_empty() {
-            return Err(BoolDBError::Parse("Column name is empty".to_string()));
+        // Extract the expression inside parentheses.
+        let paren_start = sql.find('(').ok_or_else(|| {
+            BoolDBError::Parse("Expected (column) or (json_extract(...)) after table name".to_string())
+        })?;
+        // Find the matching closing paren.
+        let inner = &sql[paren_start + 1..];
+        let paren_end = find_matching_paren(inner).ok_or_else(|| {
+            BoolDBError::Parse("Unmatched parenthesis".to_string())
+        })?;
+        let expr_str = inner[..paren_end].trim();
+
+        if expr_str.is_empty() {
+            return Err(BoolDBError::Parse("Empty index expression".to_string()));
         }
-
-        let schema = self.catalog.get_table(&table_name)?.schema.clone();
-        let col_idx = schema
-            .column_index(&col_name)
-            .ok_or_else(|| BoolDBError::ColumnNotFound(col_name.clone()))?;
 
         if self.indexes.contains_key(&idx_name) {
             return Err(BoolDBError::Sql(format!(
@@ -304,6 +302,40 @@ impl Database {
                 idx_name
             )));
         }
+
+        let schema = self.catalog.get_table(&table_name)?.schema.clone();
+
+        // Detect if this is a json_extract expression index.
+        let (col_idx, json_path, display_name) =
+            if expr_str.to_lowercase().starts_with("json_extract(") {
+                // Parse: json_extract(col, '$.path')
+                let inner2 = &expr_str["json_extract(".len()..];
+                let inner2 = inner2.trim_end_matches(')').trim();
+                let comma = inner2.find(',').ok_or_else(|| {
+                    BoolDBError::Parse("json_extract requires two arguments".to_string())
+                })?;
+                let col = inner2[..comma].trim().to_string();
+                let path_part = inner2[comma + 1..].trim();
+                let path = path_part
+                    .trim_start_matches('\'')
+                    .trim_end_matches('\'')
+                    .trim_start_matches('"')
+                    .trim_end_matches('"')
+                    .to_string();
+
+                let ci = schema
+                    .column_index(&col)
+                    .ok_or_else(|| BoolDBError::ColumnNotFound(col.clone()))?;
+                let display = format!("json_extract({}, '{}')", col, path);
+                (ci, Some(path), display)
+            } else {
+                // Regular column index.
+                let col_name = expr_str.to_string();
+                let ci = schema
+                    .column_index(&col_name)
+                    .ok_or_else(|| BoolDBError::ColumnNotFound(col_name.clone()))?;
+                (ci, None, col_name)
+            };
 
         // Build the index by scanning existing data.
         let mut idx = DiskBTree::new(&idx_name, &table_name, col_idx);
@@ -315,7 +347,15 @@ impl Database {
 
         for tuple in &tuples {
             if col_idx < tuple.values.len() {
-                idx.insert(&mut self.pool, &tuple.values[col_idx], tuple.row_id)?;
+                let key_value = if let Some(ref jp) = json_path {
+                    match &tuple.values[col_idx] {
+                        Value::Text(s) => json::json_extract(s, jp).unwrap_or(Value::Null),
+                        _ => Value::Null,
+                    }
+                } else {
+                    tuple.values[col_idx].clone()
+                };
+                idx.insert(&mut self.pool, &key_value, tuple.row_id)?;
             }
         }
 
@@ -330,6 +370,7 @@ impl Database {
                 table_name: table_name.clone(),
                 column_index: col_idx,
                 root_page_id,
+                json_path: json_path.clone(),
             },
         )?;
         self.save_catalog()?;
@@ -338,8 +379,8 @@ impl Database {
 
         Ok(ExecResult::Ok {
             message: format!(
-                "Index '{}' created on {}.{} ({} entries, depth {})",
-                idx_name, table_name, col_name, entry_count, depth
+                "Index '{}' created on {} ({} entries, depth {})",
+                idx_name, display_name, entry_count, depth
             ),
         })
     }
@@ -482,14 +523,15 @@ impl Database {
 
     /// Rebuild all disk B+Tree indexes for a given table from heap data.
     fn rebuild_indexes_for_table(&mut self, table_name: &str) -> Result<()> {
-        let index_info: Vec<(String, usize)> = match self.catalog.get_table(table_name) {
-            Ok(meta) => meta
-                .indexes
-                .iter()
-                .map(|(name, m)| (name.clone(), m.column_index))
-                .collect(),
-            Err(_) => return Ok(()),
-        };
+        let index_info: Vec<(String, usize, Option<String>)> =
+            match self.catalog.get_table(table_name) {
+                Ok(meta) => meta
+                    .indexes
+                    .iter()
+                    .map(|(name, m)| (name.clone(), m.column_index, m.json_path.clone()))
+                    .collect(),
+                Err(_) => return Ok(()),
+            };
 
         if index_info.is_empty() {
             return Ok(());
@@ -501,13 +543,11 @@ impl Database {
             .ok_or_else(|| BoolDBError::TableNotFound(table_name.to_string()))?;
         let tuples = heap.scan(&mut self.pool)?;
 
-        for (idx_name, col_idx) in &index_info {
-            // Create a fresh B+Tree and rebuild from scratch.
+        for (idx_name, col_idx, json_path) in &index_info {
             let mut new_idx = DiskBTree::new(idx_name, table_name, *col_idx);
             for tuple in &tuples {
-                if *col_idx < tuple.values.len() {
-                    new_idx.insert(&mut self.pool, &tuple.values[*col_idx], tuple.row_id)?;
-                }
+                let key = Self::extract_index_key(&tuple.values, *col_idx, json_path);
+                new_idx.insert(&mut self.pool, &key, tuple.row_id)?;
             }
 
             // Update catalog with the new root page.
@@ -533,6 +573,25 @@ impl Database {
             .collect();
         for name in to_remove {
             self.indexes.remove(&name);
+        }
+    }
+
+    /// Extract the index key value for a row, handling both regular column and json_extract.
+    fn extract_index_key(
+        row: &[Value],
+        col_idx: usize,
+        json_path: &Option<String>,
+    ) -> Value {
+        if col_idx >= row.len() {
+            return Value::Null;
+        }
+        if let Some(ref jp) = json_path {
+            match &row[col_idx] {
+                Value::Text(s) => json::json_extract(s, jp).unwrap_or(Value::Null),
+                _ => Value::Null,
+            }
+        } else {
+            row[col_idx].clone()
         }
     }
 
@@ -588,6 +647,24 @@ impl Drop for Database {
         let _ = self.pool.flush_all();
         let _ = self.save_catalog();
     }
+}
+
+/// Find the index of the matching closing parenthesis in a string.
+fn find_matching_paren(s: &str) -> Option<usize> {
+    let mut depth = 0;
+    for (i, c) in s.chars().enumerate() {
+        match c {
+            '(' => depth += 1,
+            ')' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -861,6 +938,252 @@ mod tests {
                 assert_eq!(rows.len(), 3);
             }
             _ => panic!("Expected Rows"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // --- JSON tests ---
+
+    #[test]
+    fn test_json_insert_and_select() {
+        let dir = tmp_dir("test_json_basic");
+        let mut db = Database::open(&dir).unwrap();
+
+        db.execute("CREATE TABLE events (id INTEGER PRIMARY KEY, data JSON)")
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (1, '{"name": "Alice", "age": 30}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (2, '{"name": "Bob", "age": 25}')"#)
+            .unwrap();
+
+        // Select all
+        match db.execute("SELECT * FROM events").unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_json_extract_in_select() {
+        let dir = tmp_dir("test_json_select");
+        let mut db = Database::open(&dir).unwrap();
+
+        db.execute("CREATE TABLE events (id INTEGER, data JSON)")
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (1, '{"name": "Alice", "age": 30}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (2, '{"name": "Bob", "age": 25}')"#)
+            .unwrap();
+
+        match db
+            .execute("SELECT json_extract(data, '$.name') FROM events")
+            .unwrap()
+        {
+            ExecResult::Rows { columns, rows } => {
+                assert!(columns[0].contains("json_extract"));
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0][0], Value::Text("Alice".into()));
+                assert_eq!(rows[1][0], Value::Text("Bob".into()));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_json_extract_in_where() {
+        let dir = tmp_dir("test_json_where");
+        let mut db = Database::open(&dir).unwrap();
+
+        db.execute("CREATE TABLE events (id INTEGER, data JSON)")
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (1, '{"name": "Alice", "age": 30}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (2, '{"name": "Bob", "age": 25}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (3, '{"name": "Charlie", "age": 35}')"#)
+            .unwrap();
+
+        // Filter by json_extract
+        match db
+            .execute("SELECT * FROM events WHERE json_extract(data, '$.age') > 27")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2); // Alice(30) and Charlie(35)
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        // Equality filter
+        match db
+            .execute("SELECT * FROM events WHERE json_extract(data, '$.name') = 'Bob'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(2));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_json_multiple_where_criteria() {
+        let dir = tmp_dir("test_json_multi_where");
+        let mut db = Database::open(&dir).unwrap();
+
+        db.execute("CREATE TABLE events (id INTEGER, data JSON)")
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (1, '{"name": "Alice", "age": 30, "city": "NYC"}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (2, '{"name": "Bob", "age": 25, "city": "NYC"}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (3, '{"name": "Charlie", "age": 35, "city": "LA"}')"#)
+            .unwrap();
+
+        // Multiple json_extract criteria with AND
+        match db
+            .execute("SELECT * FROM events WHERE json_extract(data, '$.age') > 27 AND json_extract(data, '$.city') = 'NYC'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1); // Only Alice: age>27 AND city=NYC
+                assert_eq!(rows[0][0], Value::Integer(1));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        // Mix json_extract with regular column filter
+        match db
+            .execute("SELECT * FROM events WHERE id >= 2 AND json_extract(data, '$.city') = 'NYC'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1); // Only Bob: id>=2 AND city=NYC
+                assert_eq!(rows[0][0], Value::Integer(2));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        // OR between json_extract criteria
+        match db
+            .execute("SELECT * FROM events WHERE json_extract(data, '$.name') = 'Alice' OR json_extract(data, '$.name') = 'Charlie'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 2);
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_json_nested_path() {
+        let dir = tmp_dir("test_json_nested");
+        let mut db = Database::open(&dir).unwrap();
+
+        db.execute("CREATE TABLE events (id INTEGER, data JSON)")
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (1, '{"address": {"city": "NYC", "zip": "10001"}}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (2, '{"address": {"city": "LA", "zip": "90001"}}')"#)
+            .unwrap();
+
+        match db
+            .execute("SELECT * FROM events WHERE json_extract(data, '$.address.city') = 'NYC'")
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0][0], Value::Integer(1));
+            }
+            _ => panic!("Expected Rows"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_json_expression_index() {
+        let dir = tmp_dir("test_json_expr_idx");
+        let mut db = Database::open(&dir).unwrap();
+
+        db.execute("CREATE TABLE events (id INTEGER, data JSON)")
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (1, '{"name": "Alice", "age": 30}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (2, '{"name": "Bob", "age": 25}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO events VALUES (3, '{"name": "Charlie", "age": 35}')"#)
+            .unwrap();
+
+        // Create expression index on json_extract(data, '$.name')
+        match db
+            .execute("CREATE INDEX idx_name ON events (json_extract(data, '$.name'))")
+            .unwrap()
+        {
+            ExecResult::Ok { message } => {
+                assert!(message.contains("idx_name"));
+                assert!(message.contains("3 entries"));
+            }
+            _ => panic!("Expected Ok"),
+        }
+
+        assert_eq!(db.index_len("idx_name").unwrap(), 3);
+
+        // Insert more data — index should be maintained.
+        db.execute(r#"INSERT INTO events VALUES (4, '{"name": "Diana", "age": 28}')"#)
+            .unwrap();
+        assert_eq!(db.index_len("idx_name").unwrap(), 4);
+
+        // Delete — index should be maintained.
+        db.execute("DELETE FROM events WHERE id = 2").unwrap();
+        assert_eq!(db.index_len("idx_name").unwrap(), 3);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn test_json_expression_index_persistence() {
+        let dir = tmp_dir("test_json_idx_persist");
+
+        {
+            let mut db = Database::open(&dir).unwrap();
+            db.execute("CREATE TABLE events (id INTEGER, data JSON)")
+                .unwrap();
+            db.execute(r#"INSERT INTO events VALUES (1, '{"name": "Alice"}')"#)
+                .unwrap();
+            db.execute(r#"INSERT INTO events VALUES (2, '{"name": "Bob"}')"#)
+                .unwrap();
+            db.execute("CREATE INDEX idx_name ON events (json_extract(data, '$.name'))")
+                .unwrap();
+            assert_eq!(db.index_len("idx_name").unwrap(), 2);
+        }
+
+        // Reopen — expression index should persist.
+        {
+            let mut db = Database::open(&dir).unwrap();
+            assert_eq!(db.index_len("idx_name").unwrap(), 2);
+
+            // Queries should still work.
+            match db
+                .execute("SELECT * FROM events WHERE json_extract(data, '$.name') = 'Alice'")
+                .unwrap()
+            {
+                ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 1),
+                _ => panic!("Expected Rows"),
+            }
         }
 
         std::fs::remove_dir_all(&dir).unwrap();

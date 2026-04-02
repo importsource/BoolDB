@@ -1,5 +1,6 @@
 use crate::error::{BoolDBError, Result};
-use crate::sql::planner::{CmpOp, FilterExpr, JoinClause, JoinType, LogicalPlan, Projection};
+use crate::sql::json::json_extract;
+use crate::sql::planner::{CmpOp, FilterExpr, JoinClause, JoinType, LogicalPlan, Projection, SelectExpr};
 use crate::storage::buffer::BufferPool;
 use crate::storage::heap::HeapFile;
 use crate::catalog::schema::Catalog;
@@ -248,20 +249,40 @@ fn exec_select(
             let names = joined_schema.columns.iter().map(|c| c.name.clone()).collect();
             (names, filtered)
         }
-        Projection::Columns(cols) => {
-            let indices: Vec<usize> = cols
-                .iter()
-                .map(|c| {
-                    joined_schema
-                        .column_index(c)
-                        .ok_or_else(|| BoolDBError::ColumnNotFound(c.clone()))
-                })
-                .collect::<Result<Vec<_>>>()?;
+        Projection::Expressions(exprs) => {
+            let mut names = Vec::new();
+            let mut projectors: Vec<Box<dyn Fn(&Row) -> Value>> = Vec::new();
+
+            for expr in exprs {
+                match expr {
+                    SelectExpr::Column(col) => {
+                        let idx = joined_schema
+                            .column_index(col)
+                            .ok_or_else(|| BoolDBError::ColumnNotFound(col.clone()))?;
+                        names.push(col.clone());
+                        projectors.push(Box::new(move |row: &Row| row[idx].clone()));
+                    }
+                    SelectExpr::JsonExtract { column, path } => {
+                        let idx = joined_schema
+                            .column_index(column)
+                            .ok_or_else(|| BoolDBError::ColumnNotFound(column.clone()))?;
+                        let path = path.clone();
+                        names.push(format!("json_extract({}, '{}')", column, path));
+                        projectors.push(Box::new(move |row: &Row| {
+                            match &row[idx] {
+                                Value::Text(s) => json_extract(s, &path).unwrap_or(Value::Null),
+                                _ => Value::Null,
+                            }
+                        }));
+                    }
+                }
+            }
+
             let projected: Vec<Row> = filtered
                 .into_iter()
-                .map(|row| indices.iter().map(|&i| row[i].clone()).collect())
+                .map(|row| projectors.iter().map(|p| p(&row)).collect())
                 .collect();
-            (cols.clone(), projected)
+            (names, projected)
         }
     };
 
@@ -370,6 +391,30 @@ pub fn evaluate_filter(filter: &FilterExpr, row: &Row, schema: &Schema) -> bool 
                 CmpOp::Gt => row_val.partial_cmp(value) == Some(std::cmp::Ordering::Greater),
                 CmpOp::GtEq => matches!(
                     row_val.partial_cmp(value),
+                    Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                ),
+            }
+        }
+        FilterExpr::JsonExtract { column, path, op, value } => {
+            let idx = match schema.column_index(column) {
+                Some(i) => i,
+                None => return false,
+            };
+            let extracted = match &row[idx] {
+                Value::Text(s) => json_extract(s, path).unwrap_or(Value::Null),
+                _ => Value::Null,
+            };
+            match op {
+                CmpOp::Eq => extracted == *value,
+                CmpOp::NotEq => extracted != *value,
+                CmpOp::Lt => extracted.partial_cmp(value) == Some(std::cmp::Ordering::Less),
+                CmpOp::LtEq => matches!(
+                    extracted.partial_cmp(value),
+                    Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                ),
+                CmpOp::Gt => extracted.partial_cmp(value) == Some(std::cmp::Ordering::Greater),
+                CmpOp::GtEq => matches!(
+                    extracted.partial_cmp(value),
                     Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
                 ),
             }

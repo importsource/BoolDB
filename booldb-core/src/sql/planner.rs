@@ -38,11 +38,18 @@ pub enum LogicalPlan {
     },
 }
 
+/// An expression in a SELECT projection.
+#[derive(Debug, Clone)]
+pub enum SelectExpr {
+    Column(String),
+    JsonExtract { column: String, path: String },
+}
+
 /// What columns to return.
 #[derive(Debug, Clone)]
 pub enum Projection {
     All,
-    Columns(Vec<String>),
+    Expressions(Vec<SelectExpr>),
 }
 
 /// A filter expression (WHERE clause).
@@ -50,6 +57,12 @@ pub enum Projection {
 pub enum FilterExpr {
     Comparison {
         column: String,
+        op: CmpOp,
+        value: Value,
+    },
+    JsonExtract {
+        column: String,
+        path: String,
         op: CmpOp,
         value: Value,
     },
@@ -227,35 +240,19 @@ fn plan_select(select: &ast::Select) -> Result<LogicalPlan> {
     };
 
     // Parse projection
-    let projection = if select.projection.len() == 1 {
-        match &select.projection[0] {
-            SelectItem::Wildcard(_) => Projection::All,
-            SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                Projection::Columns(vec![ident.value.clone()])
-            }
-            _ => {
-                let cols: Vec<String> = select
-                    .projection
-                    .iter()
-                    .map(|item| match item {
-                        SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
-                            Ok(ident.value.clone())
-                        }
-                        _ => Err(BoolDBError::Sql(format!(
-                            "Unsupported projection: {:?}",
-                            item
-                        ))),
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Projection::Columns(cols)
-            }
-        }
+    let projection = if select.projection.len() == 1
+        && matches!(&select.projection[0], SelectItem::Wildcard(_))
+    {
+        Projection::All
     } else {
-        let cols: Vec<String> = select
+        let exprs: Vec<SelectExpr> = select
             .projection
             .iter()
             .map(|item| match item {
-                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => Ok(ident.value.clone()),
+                SelectItem::UnnamedExpr(Expr::Identifier(ident)) => {
+                    Ok(SelectExpr::Column(ident.value.clone()))
+                }
+                SelectItem::UnnamedExpr(expr) => parse_select_expr(expr),
                 SelectItem::Wildcard(_) => Err(BoolDBError::Sql(
                     "Wildcard must be the only projection item".to_string(),
                 )),
@@ -265,7 +262,7 @@ fn plan_select(select: &ast::Select) -> Result<LogicalPlan> {
                 ))),
             })
             .collect::<Result<Vec<_>>>()?;
-        Projection::Columns(cols)
+        Projection::Expressions(exprs)
     };
 
     // Parse WHERE clause
@@ -414,6 +411,50 @@ pub fn convert_expr_to_value(expr: &Expr) -> Result<Value> {
 }
 
 /// Convert a WHERE expression AST node to our FilterExpr.
+/// Parse a SELECT expression (column or json_extract call).
+fn parse_select_expr(expr: &Expr) -> Result<SelectExpr> {
+    if let Some((col, path)) = try_parse_json_extract(expr) {
+        return Ok(SelectExpr::JsonExtract { column: col, path });
+    }
+    match expr {
+        Expr::Identifier(ident) => Ok(SelectExpr::Column(ident.value.clone())),
+        _ => Err(BoolDBError::Sql(format!(
+            "Unsupported select expression: {:?}",
+            expr
+        ))),
+    }
+}
+
+/// Try to parse `json_extract(column, '$.path')` from an AST expression.
+fn try_parse_json_extract(expr: &Expr) -> Option<(String, String)> {
+    match expr {
+        Expr::Function(func) => {
+            let name = func.name.to_string().to_lowercase();
+            if name != "json_extract" {
+                return None;
+            }
+            let args = &func.args;
+            if args.len() != 2 {
+                return None;
+            }
+            let col = match &args[0] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(Expr::Identifier(ident))) => {
+                    ident.value.clone()
+                }
+                _ => return None,
+            };
+            let path = match &args[1] {
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(Expr::Value(
+                    SqlValue::SingleQuotedString(s),
+                ))) => s.clone(),
+                _ => return None,
+            };
+            Some((col, path))
+        }
+        _ => None,
+    }
+}
+
 fn convert_expr_to_filter(expr: &Expr) -> Result<FilterExpr> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
@@ -432,17 +473,6 @@ fn convert_expr_to_filter(expr: &Expr) -> Result<FilterExpr> {
                 _ => {}
             }
 
-            // Column comparison
-            let column = match left.as_ref() {
-                Expr::Identifier(ident) => ident.value.clone(),
-                _ => {
-                    return Err(BoolDBError::Sql(format!(
-                        "Left side of comparison must be a column name, got: {:?}",
-                        left
-                    )))
-                }
-            };
-
             let cmp_op = match op {
                 ast::BinaryOperator::Eq => CmpOp::Eq,
                 ast::BinaryOperator::NotEq => CmpOp::NotEq,
@@ -459,6 +489,28 @@ fn convert_expr_to_filter(expr: &Expr) -> Result<FilterExpr> {
             };
 
             let value = convert_expr_to_value(right)?;
+
+            // Check if left side is json_extract(col, '$.path')
+            if let Some((col, path)) = try_parse_json_extract(left) {
+                return Ok(FilterExpr::JsonExtract {
+                    column: col,
+                    path,
+                    op: cmp_op,
+                    value,
+                });
+            }
+
+            // Regular column comparison
+            let column = match left.as_ref() {
+                Expr::Identifier(ident) => ident.value.clone(),
+                _ => {
+                    return Err(BoolDBError::Sql(format!(
+                        "Left side of comparison must be a column name or json_extract(), got: {:?}",
+                        left
+                    )))
+                }
+            };
+
             Ok(FilterExpr::Comparison {
                 column,
                 op: cmp_op,

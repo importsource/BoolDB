@@ -21,6 +21,7 @@ pub enum DataType {
     Float,
     Text,
     Boolean,
+    Json,
 }
 
 impl fmt::Display for DataType {
@@ -30,6 +31,7 @@ impl fmt::Display for DataType {
             DataType::Float => write!(f, "FLOAT"),
             DataType::Text => write!(f, "TEXT"),
             DataType::Boolean => write!(f, "BOOLEAN"),
+            DataType::Json => write!(f, "JSON"),
         }
     }
 }

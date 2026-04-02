@@ -10,3 +10,4 @@ crc32fast = "1"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 sqlparser = { version = "0.43", features = ["serde"] }
+serde_json = "1"
